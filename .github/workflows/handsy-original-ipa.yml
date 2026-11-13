@@ -1,0 +1,101 @@
+name: Handsy original 1.0.6 unsigned IPA
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/handsy-original-ipa.yml]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: handsy-original-ipa
+  cancel-in-progress: false
+jobs:
+  build:
+    if: ${{ github.event.repository.private == false }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: onehumanbeing/esp32-iphone-agent
+          ref: 39aa23e17de957bc01529fbd8f22f4deef0e08ca
+          persist-credentials: false
+      - name: Verify original source and toolchain
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "39aa23e17de957bc01529fbd8f22f4deef0e08ca"
+          git diff --exit-code
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          test -f LICENSE
+          test -f NOTICE
+          test ! -f ios/Config/Local.xcconfig
+      - name: Build original device Release without signing
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          xcodebuild -project ios/IPhoneAgent.xcodeproj -scheme IPhoneAgent \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build-device CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" build > output/xcodebuild.log 2>&1 || {
+              tail -n 150 output/xcodebuild.log
+              exit 1
+            }
+      - name: Validate and package IPA
+        run: |
+          set -euo pipefail
+          mkdir -p package/Payload
+          ditto build-device/Build/Products/Release-iphoneos/IPhoneAgent.app package/Payload/IPhoneAgent.app
+          cp LICENSE package/Payload/IPhoneAgent.app/UPSTREAM-LICENSE.txt
+          cp NOTICE package/Payload/IPhoneAgent.app/UPSTREAM-NOTICE.txt
+          python3 - <<'PY'
+          import json, pathlib, plistlib, subprocess
+          root = pathlib.Path("package/Payload/IPhoneAgent.app")
+          app = plistlib.loads((root / "Info.plist").read_bytes())
+          assert app["CFBundleShortVersionString"] == "1.0.6", app
+          assert app["CFBundleIdentifier"] == "com.example.esp32agent", app
+          assert app["CFBundleSupportedPlatforms"] == ["iPhoneOS"], app
+          assert not list(root.rglob("embedded.mobileprovision"))
+          assert not list(root.rglob("_CodeSignature"))
+          extension = root / "PlugIns" / "AgentActivity.appex"
+          ext = plistlib.loads((extension / "Info.plist").read_bytes())
+          assert ext["CFBundleIdentifier"] == app["CFBundleIdentifier"] + ".activity"
+          assert ext["CFBundleShortVersionString"] == app["CFBundleShortVersionString"]
+          for target, info in ((root, app), (extension, ext)):
+              binary = target / info["CFBundleExecutable"]
+              arch = subprocess.check_output(["lipo", "-archs", str(binary)], text=True).strip()
+              assert arch == "arm64", arch
+          metadata = {
+              "project": "ESP32 iPhone Agent / Handsy AI",
+              "author": "Henry Yuan",
+              "source": "https://github.com/onehumanbeing/esp32-iphone-agent",
+              "source_commit": "39aa23e17de957bc01529fbd8f22f4deef0e08ca",
+              "version": app["CFBundleShortVersionString"],
+              "build": app["CFBundleVersion"],
+              "bundle_id": app["CFBundleIdentifier"],
+              "signed": False,
+              "architecture": "arm64",
+              "source_modifications": [],
+              "device_tested": False
+          }
+          pathlib.Path("output/build-info.json").write_text(json.dumps(metadata, indent=2) + "\n")
+          PY
+          (cd package && /usr/bin/zip -q -r -y ../output/Handsy-ESP32-Agent-1.0.6-original-unsigned.ipa Payload)
+          unzip -t output/Handsy-ESP32-Agent-1.0.6-original-unsigned.ipa | tail -n 1
+          shasum -a 256 output/Handsy-ESP32-Agent-1.0.6-original-unsigned.ipa > output/SHA256SUMS.txt
+          cp LICENSE NOTICE output/
+          git diff --exit-code
+      - name: Publish only verified public-source output
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="handsy-1.0.6-build-${GITHUB_RUN_ID}"
+          gh release create "$tag" \
+            output/Handsy-ESP32-Agent-1.0.6-original-unsigned.ipa \
+            output/SHA256SUMS.txt output/build-info.json output/LICENSE output/NOTICE \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Handsy 1.0.6 unsigned source build" \
+            --notes "Built from Henry Yuan's public ESP32 iPhone Agent source, commit 39aa23e17de957bc01529fbd8f22f4deef0e08ca. This is an unsigned iPhone device app, not a simulator app. No source changes or model credentials are included. Requires the user's own signing and model setup. Physical device operation has not been verified." \
+            --prerelease
